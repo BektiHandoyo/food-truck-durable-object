@@ -4,13 +4,13 @@
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "durable-object-starter",
+	"name": "food-truck-durable-object",
 	"main": "src/index.js",
 	"compatibility_date": "2026-11-10",
 	"migrations": [
 		{
 			"new_sqlite_classes": [
-				"MyDurableObject"
+				"SlotCell"
 			],
 			"tag": "v1"
 		}
@@ -18,15 +18,11 @@
 	"durable_objects": {
 		"bindings": [
 			{
-				"class_name": "MyDurableObject",
-				"name": "MY_DURABLE_OBJECT"
+				"class_name": "SlotCell",
+				"name": "SLOT_CELL"
 			}
 		]
-	},
-	"observability": {
-		"enabled": true
-	},
-	"upload_source_maps": true
+	}	
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement

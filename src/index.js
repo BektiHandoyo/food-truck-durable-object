@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { ok, fail } from "./lib/response";
 
 /**
  * Welcome to Cloudflare Workers! This is your first Durable Objects application.
@@ -18,7 +19,7 @@ import { DurableObject } from "cloudflare:workers";
  */
 
 /** A Durable Object's behavior is defined in an exported Javascript class */
-export class MyDurableObject extends DurableObject {
+export class SlotCell extends DurableObject {
 	/**
 	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
 	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
@@ -37,7 +38,7 @@ export class MyDurableObject extends DurableObject {
 	 * @param {string} name - The name provided to a Durable Object instance from a Worker
 	 * @returns {Promise<string>} The greeting to be sent back to the Worker
 	 */
-	async sayHello(name) {
+	async sayHello(name, error) {
 		return `Hello, ${name}!`;
 	}
 }
@@ -57,7 +58,7 @@ export default {
 		//
 		// Requests from all Workers to the Durable Object instance named "foo"
 		// will go to a single remote Durable Object instance.
-		const stub = env.MY_DURABLE_OBJECT.getByName("foo");
+		const stub = env.SLOT_CELL.getByName("foo");
 
 		// Call the `sayHello()` RPC method on the stub to invoke the method on
 		// the remote Durable Object instance.
