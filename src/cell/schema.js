@@ -1,7 +1,4 @@
-const initSchema = (sql) => {
-    // create table if not exist
-    // slots with column id text as primary key, slot_time integer not null, quota integer not null (must check if the quota is not zero or negative), claimed boolean
-    // claims with column id text as primary key, request_id text not null, user_id text not null, queue_pos integer not null, status text with default 'CLAIMED', claimed_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, redeemed_at INTEGER
+export const initSchema = (sql) => {
     sql.exec(`
         CREATE TABLE IF NOT EXISTS slots (
             id TEXT PRIMARY KEY,
@@ -21,6 +18,8 @@ const initSchema = (sql) => {
             redeemed_at INTEGER
         );
 
-        CREATE UNIQUE INDEX idx_one_active_per_user ON claims(user_id) WHERE status = 'CLAIMED';
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_per_user
+            ON claims(user_id) WHERE status = 'CLAIMED';
     `);
-}
+};
+
