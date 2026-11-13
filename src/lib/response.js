@@ -5,10 +5,10 @@ export const ok = (data) => {
     });
 }
 
-export const fail = (reason, status = 200) => {
+export const fail = (reason, status = 400) => {
     return Response.json({
         ok: false,
-        error: reason
+        ...reason
     }, {status});
 }
 

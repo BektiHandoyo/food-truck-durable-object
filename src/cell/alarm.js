@@ -1,4 +1,4 @@
-export const scheduleNextAlarm = (ctx, sql) => {
+export const scheduleNextAlarm = async (ctx, sql) => {
     const minExpiresAt = sql.prepare(`
         SELECT MIN(expires_at) as min_expires_at FROM claims WHERE status = 'CLAIMED' AND expires_at IS NOT NULL
     `).get().min_expires_at;
@@ -9,13 +9,13 @@ export const scheduleNextAlarm = (ctx, sql) => {
     }
 
     // if exist, set the alarm to the next soonest expires_at plus Date now with Math.max 
-    const nextAlarm = Math.max(minExpiresAt - Date.now(), 0);
-    ctx.storage.setAlarm(nextAlarm);
+    const nextAlarm = Math.max(minExpiresAt, Date.now());
+    await ctx.storage.setAlarm(nextAlarm);
 }
 
 export const runAlarm = async (ctx, sql, slotId) => {
     const expiredClaims = sql.prepare(`
-        SELECT * FROM claims WHERE status = 'CLAIMED' AND expires_at < ?
+        SELECT * FROM claims WHERE status = 'CLAIMED' AND expires_at <= ?
     `).all(Date.now());
     
     if (expiredClaims.length > 0) {
