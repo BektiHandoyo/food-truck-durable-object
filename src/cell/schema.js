@@ -2,11 +2,11 @@ export const initSchema = (sql) => {
     sql.exec(`
         CREATE TABLE IF NOT EXISTS slots (
             id TEXT PRIMARY KEY,
-            slot_time INTEGER NOT NULL,
+            slot_time TEXT NOT NULL,
             quota INTEGER NOT NULL CHECK (quota > 0),
             claimed INTEGER NOT NULL DEFAULT 0
         );
-        
+
         CREATE TABLE IF NOT EXISTS claims (
             id TEXT PRIMARY KEY,
             request_id TEXT NOT NULL,
@@ -15,12 +15,15 @@ export const initSchema = (sql) => {
             queue_pos INTEGER NOT NULL,
             status TEXT NOT NULL DEFAULT 'CLAIMED',
             claimed_at INTEGER NOT NULL,
-            expires_at INTEGER NOT NULL,
+            expires_at INTEGER,
             redeemed_at INTEGER
         );
 
         CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_per_user
             ON claims(user_id) WHERE status = 'CLAIMED';
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_claims_request_id
+            ON claims(request_id);
     `);
 };
 

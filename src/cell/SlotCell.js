@@ -1,13 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 import { initSchema } from "./schema.js";
 import { ok, fail } from "../lib/response.js";
-import { runAlarm } from "./alarm.js";
 
 export default class SlotCell extends DurableObject {
     /**
-     * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
-     * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
-     *
      * @param {DurableObjectState} ctx - The interface for interacting with Durable Object state
      * @param {Env} env - The interface to reference bindings declared in wrangler.jsonc
      */
@@ -15,29 +11,37 @@ export default class SlotCell extends DurableObject {
         super(ctx, env);
         this.sql = ctx.storage.sql;
         this.storage = ctx.storage;
+        this.ctx = ctx;
         this.slotId = ctx.id.name ?? "unknown";
         initSchema(this.sql);
     }
 
-    // method for initializing slots with Insert or ignore if exists
-    async initSlots(slots) {
+    async initSlots(input) {
         try {
+            const slots = Array.isArray(input) ? input : input?.slots;
+            if (!Array.isArray(slots) || slots.length === 0) {
+                return fail({ message: "Slots array is required" });
+            }
+
             for (const slot of slots) {
-                if (slot.slot_time <= Date.now()) {
-                    return fail({ message: "Slot time must be in the future" });
+                if (!slot?.id || slot?.slot_time === undefined || slot?.slot_time === null || String(slot.slot_time).trim() === "") {
+                    return fail({ message: "Each slot must have id and slot_time" });
                 }
-                if (slot.quota <= 0) {
+                if (typeof slot.quota !== "number" || slot.quota <= 0) {
                     return fail({ message: "Quota must be greater than 0" });
                 }
             }
 
-            // 2. Gunakan transactionSync (tanpa tanda kurung () tambahan di akhir)
             this.storage.transactionSync(() => {
                 for (const slot of slots) {
                     this.sql.exec(
-                        `INSERT OR IGNORE INTO slots (id, slot_time, quota, claimed) VALUES (?, ?, ?, ?)`,
-                        slot.id,
-                        slot.slot_time,
+                        `INSERT INTO slots (id, slot_time, quota, claimed)
+                         VALUES (?, ?, ?, ?)
+                         ON CONFLICT(id) DO UPDATE SET
+                             slot_time = excluded.slot_time,
+                             quota = excluded.quota`,
+                        String(slot.id),
+                        String(slot.slot_time),
                         slot.quota,
                         slot.claimed ?? 0
                     );
@@ -52,11 +56,10 @@ export default class SlotCell extends DurableObject {
 
     async claimSlot(userId, slotId, requestId) {
         try {
-            if (!requestId) {
-                return fail({ message: "request_id is required" });
+            if (!userId || !slotId || !requestId) {
+                return fail({ message: "user_id, slot_id, and request_id are required" });
             }
 
-            // Bungkus pengecekan & penulisan dalam satu transaksi sinkron agar 100% atomik
             const result = this.storage.transactionSync(() => {
                 // 1. Replay check (idempotency)
                 const existingReq = this.sql
@@ -69,14 +72,15 @@ export default class SlotCell extends DurableObject {
                         data: {
                             replayed: true,
                             claimId: existingReq.id,
+                            slotId: existingReq.slot_id,
                             queuePos: existingReq.queue_pos,
                             status: existingReq.status,
                             claimedAt: existingReq.claimed_at,
-                            expiresAt: existingReq.expires_at,
                         },
                     };
                 }
 
+                // 2. Cek ketersediaan slot
                 const slot = this.sql
                     .exec(`SELECT * FROM slots WHERE id = ?`, slotId)
                     .toArray()[0];
@@ -90,7 +94,7 @@ export default class SlotCell extends DurableObject {
                     return { success: false, message: "Slot is full" };
                 }
 
-                // 4. Cek apakah user sudah pernah claim dan statusnya masih CLAIMED
+                // 4. Cek apakah user sudah memiliki tiket aktif (status = 'CLAIMED') hari ini
                 const existingUserClaim = this.sql
                     .exec(
                         `SELECT id FROM claims WHERE user_id = ? AND status = 'CLAIMED'`,
@@ -102,22 +106,20 @@ export default class SlotCell extends DurableObject {
                     return { success: false, message: "User has already claimed a slot" };
                 }
 
-                // 5. Insert claim & update counter slot.claimed secara sinkron
+                // 5. Insert claim & update counter slot.claimed secara sinkron (tanpa auto-expire alarm)
                 const claimId = crypto.randomUUID();
                 const queuePos = slot.claimed + 1;
                 const claimedAt = Date.now();
-                const expiresAt = slot.slot_time + 15 * 60 * 1000; // slot_time + 15 menit
 
                 this.sql.exec(
-                    `INSERT INTO claims (id, request_id, slot_id, user_id, queue_pos, status, claimed_at, expires_at)
-                    VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?, ?)`,
+                    `INSERT INTO claims (id, request_id, slot_id, user_id, queue_pos, status, claimed_at)
+                     VALUES (?, ?, ?, ?, ?, 'CLAIMED', ?)`,
                     claimId,
                     requestId,
                     slotId,
                     userId,
                     queuePos,
-                    claimedAt,
-                    expiresAt
+                    claimedAt
                 );
 
                 this.sql.exec(
@@ -130,21 +132,16 @@ export default class SlotCell extends DurableObject {
                     isNewClaim: true,
                     data: {
                         claimId,
+                        slotId,
                         queuePos,
                         status: "CLAIMED",
                         claimedAt,
-                        expiresAt,
                     },
                 };
             });
 
             if (!result.success) {
                 return fail({ message: result.message });
-            }
-
-            // 6. Setelah jendela kritis transaksi selesai, jadwalkan alarm untuk auto-expire
-            if (result.isNewClaim && typeof this.scheduleNextAlarm === "function") {
-                await this.scheduleNextAlarm();
             }
 
             return ok(result.data);
@@ -211,25 +208,22 @@ export default class SlotCell extends DurableObject {
         }
     }
 
-    // method for alarm, execute runAlarm method
-    async alarm() {
-        await runAlarm(this, this.sql, this.slotId);
-    }
-
     // method for fetching all of the defined methods above, this is the main entry point for the Durable Object
     async fetch(request) {
         const url = new URL(request.url);
         const path = url.pathname;
         const method = request.method;
 
-        // change the above to switch case for better readability, filter by method first, then use if and else if for path
         switch (method) {
             case "POST":
-                if (path === "/init") {
+                if (path === "/init" || path === "/slots/init") {
                     const slots = await request.json();
                     return this.initSlots(slots);
-                } else if (path === "/slot/claim") {
-                    const { userId, slotId, requestId } = await request.json();
+                } else if (path === "/slot/claim" || path === "/claim") {
+                    const body = await request.json();
+                    const userId = body.user_id ?? body.userId;
+                    const slotId = body.slot_id ?? body.slotId;
+                    const requestId = body.request_id ?? body.requestId;
                     return this.claimSlot(userId, slotId, requestId);
                 } else if (path.startsWith("/claim/redeem/")) {
                     const claimId = path.split("/")[3];
@@ -240,7 +234,7 @@ export default class SlotCell extends DurableObject {
             case "GET":
                 if (path === "/") {
                     return ok({ message: "SlotCell Durable Object is running" });
-                } else if (path === "/slot") {
+                } else if (path === "/slot" || path === "/slots") {
                     return this.getSlots();
                 } else if (path.startsWith("/claim/")) {
                     const claimId = path.split("/")[2];
@@ -252,5 +246,4 @@ export default class SlotCell extends DurableObject {
                 return fail({ message: "Method Not Allowed" });
         }
     }
-
 }
