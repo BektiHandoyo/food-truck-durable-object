@@ -1,10 +1,10 @@
 export const scheduleNextAlarm = async (ctx, sql) => {
-    const minExpiresAt = sql.prepare(`
+    const minExpiresAt = sql.exec(`
         SELECT MIN(expires_at) as min_expires_at FROM claims WHERE status = 'CLAIMED' AND expires_at IS NOT NULL
-    `).get().min_expires_at;
+    `).toArray();
 
     if (!minExpiresAt) {
-        ctx.storage.deleteAlarm();
+        await ctx.storage.deleteAlarm();
         return;
     }
 
@@ -14,28 +14,19 @@ export const scheduleNextAlarm = async (ctx, sql) => {
 }
 
 export const runAlarm = async (ctx, sql, slotId) => {
-    const expiredClaims = sql.prepare(`
+    const expiredClaims = sql.exec(`
         SELECT * FROM claims WHERE status = 'CLAIMED' AND expires_at <= ?
-    `).all(Date.now());
+    `, Date.now()).toArray();
     
     if (expiredClaims.length > 0) {
-        const updateSlotStmt = sql.prepare(`
-            UPDATE slots SET claimed = claimed - 1 WHERE id = ?
-        `);
-        const updateClaimStmt = sql.prepare(`
-            UPDATE claims SET status = 'EXPIRED' WHERE id = ?
-        `);
-
-        const transaction = sql.transaction((claims) => {
-            for (const claim of claims) {
-                updateSlotStmt.run(claim.slot_id);
-                updateClaimStmt.run(claim.id);
+        ctx.storage.transactionSync(() => {
+            for (const claim of expiredClaims) {
+                sql.exec(`UPDATE claims SET status = 'EXPIRED' WHERE id = ?`, claim.id);
+                sql.exec(`UPDATE slots SET claimed = claimed - 1 WHERE id = ?`, claim.slot_id);
             }
         });
-
-        transaction(expiredClaims);
     }
 
-    scheduleNextAlarm(ctx, sql);    
+    await scheduleNextAlarm(ctx, sql);    
 }
 

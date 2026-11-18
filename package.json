@@ -9,5 +9,8 @@
   },
   "devDependencies": {
     "wrangler": "^4.160.1"
+  },
+  "dependencies": {
+    "zod": "^4.6.7"
   }
 }
