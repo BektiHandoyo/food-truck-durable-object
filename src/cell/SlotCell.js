@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { initSchema } from "./schema.js";
 import { ok, fail } from "../lib/response.js";
+import { initSlotsSchema, claimSlotSchema } from "../schemas/slotSchemas.js";
 
 export default class SlotCell extends DurableObject {
     /**
@@ -12,26 +13,66 @@ export default class SlotCell extends DurableObject {
         this.sql = ctx.storage.sql;
         this.storage = ctx.storage;
         this.ctx = ctx;
+        this.env = env;
         this.slotId = ctx.id.name ?? "unknown";
         initSchema(this.sql);
     }
 
-    async initSlots(input) {
+    isAuthorized(request) {
+        const expectedSecret = this.env?.DO_API_SECRET;
+        if (!expectedSecret) {
+            return false;
+        }
+
+        const headerSecret = request.headers.get("X-API-Secret")?.trim();
+        if (headerSecret && headerSecret === expectedSecret) {
+            return true;
+        }
+
+        const authHeader = request.headers.get("Authorization")?.trim();
+        if (authHeader?.startsWith("Bearer ")) {
+            const bearerToken = authHeader.slice(7).trim();
+            if (bearerToken === expectedSecret) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    async parseBody(request, schema) {
+        let rawBody;
         try {
-            const slots = Array.isArray(input) ? input : input?.slots;
-            if (!Array.isArray(slots) || slots.length === 0) {
-                return fail({ message: "Slots array is required" });
-            }
+            rawBody = await request.json();
+        } catch {
+            return {
+                ok: false,
+                response: fail({ message: "Invalid JSON body" }, 400),
+            };
+        }
 
-            for (const slot of slots) {
-                if (!slot?.id || slot?.slot_time === undefined || slot?.slot_time === null || String(slot.slot_time).trim() === "") {
-                    return fail({ message: "Each slot must have id and slot_time" });
-                }
-                if (typeof slot.quota !== "number" || slot.quota <= 0) {
-                    return fail({ message: "Quota must be greater than 0" });
-                }
-            }
+        const parsed = schema.safeParse(rawBody);
+        if (!parsed.success) {
+            return {
+                ok: false,
+                response: fail(
+                    {
+                        message: "Invalid request payload",
+                        errors: parsed.error.issues.map((issue) => ({
+                            path: issue.path.join("."),
+                            message: issue.message,
+                        })),
+                    },
+                    400
+                ),
+            };
+        }
 
+        return { ok: true, data: parsed.data };
+    }
+
+    async initSlots(slots) {
+        try {
             this.storage.transactionSync(() => {
                 for (const slot of slots) {
                     this.sql.exec(
@@ -40,8 +81,8 @@ export default class SlotCell extends DurableObject {
                          ON CONFLICT(id) DO UPDATE SET
                              slot_time = excluded.slot_time,
                              quota = excluded.quota`,
-                        String(slot.id),
-                        String(slot.slot_time),
+                        slot.id,
+                        slot.slot_time,
                         slot.quota,
                         slot.claimed ?? 0
                     );
@@ -56,10 +97,6 @@ export default class SlotCell extends DurableObject {
 
     async claimSlot(userId, slotId, requestId) {
         try {
-            if (!userId || !slotId || !requestId) {
-                return fail({ message: "user_id, slot_id, and request_id are required" });
-            }
-
             const result = this.storage.transactionSync(() => {
                 // 1. Replay check (idempotency)
                 const existingReq = this.sql
@@ -106,7 +143,7 @@ export default class SlotCell extends DurableObject {
                     return { success: false, message: "User has already claimed a slot" };
                 }
 
-                // 5. Insert claim & update counter slot.claimed secara sinkron (tanpa auto-expire alarm)
+                // 5. Insert claim & update counter slot.claimed secara sinkron
                 const claimId = crypto.randomUUID();
                 const queuePos = slot.claimed + 1;
                 const claimedAt = Date.now();
@@ -150,22 +187,53 @@ export default class SlotCell extends DurableObject {
         }
     }
 
-    // method for displaying the current state of all slots
     async getSlots() {
         try {
-            const slots = this.sql.exec(`SELECT * FROM slots`).toArray();
+            const rows = this.sql.exec(`SELECT * FROM slots`).toArray();
+            const slots = rows.map((slot) => ({
+                id: slot.id,
+                slot_time: slot.slot_time,
+                quota: slot.quota,
+                claimed: slot.claimed,
+                remaining: Math.max(0, slot.quota - slot.claimed),
+            }));
             return ok({ slots });
         } catch (error) {
             return fail({ message: "Failed to retrieve slots", error: error.message });
         }
     }
 
-    // method for displaying the current state for spesific claims with supplied claim id input
+    async getMyClaim(userId) {
+        try {
+            if (!userId || !userId.trim()) {
+                return fail({ message: "user_id query parameter is required" }, 400);
+            }
+
+            const claim = this.sql
+                .exec(
+                    `SELECT c.id as claimId, c.slot_id as slotId, s.slot_time as slotTime,
+                            c.user_id as userId, c.queue_pos as queuePos, c.status,
+                            c.claimed_at as claimedAt, c.redeemed_at as redeemedAt
+                     FROM claims c
+                     LEFT JOIN slots s ON s.id = c.slot_id
+                     WHERE c.user_id = ?
+                     ORDER BY CASE WHEN c.status = 'CLAIMED' THEN 0 ELSE 1 END, c.claimed_at DESC
+                     LIMIT 1`,
+                    userId.trim()
+                )
+                .toArray()[0];
+
+            return ok({ claim: claim ?? null });
+        } catch (error) {
+            return fail({ message: "Failed to retrieve user claim", error: error.message });
+        }
+    }
+
     async getClaim(claimId) {
         try {
             const claim = this.sql.exec(`SELECT * FROM claims WHERE id = ?`, claimId).toArray()[0];
             if (!claim) {
-                return fail({ message: "Claim not found" });
+                return fail({ message: "Claim not found" }, 404);
             }
             return ok({ claim });
         } catch (error) {
@@ -173,7 +241,6 @@ export default class SlotCell extends DurableObject {
         }
     }
 
-    // method for redeeming a claim, check if claim exists and status is CLAIMED, then update status to REDEEMED and set redeemed_at to current timestamp, also decrement the claimed count in slots table
     async redeemClaim(claimId) {
         try {
             const claim = this.sql
@@ -190,7 +257,6 @@ export default class SlotCell extends DurableObject {
 
             const redeemedAt = Date.now();
 
-            // Langsung exec tanpa transactionSync dan tanpa .run()
             this.sql.exec(
                 `UPDATE claims SET status = 'REDEEMED', redeemed_at = ? WHERE id = ?`,
                 redeemedAt,
@@ -208,42 +274,51 @@ export default class SlotCell extends DurableObject {
         }
     }
 
-    // method for fetching all of the defined methods above, this is the main entry point for the Durable Object
     async fetch(request) {
+        if (!this.isAuthorized(request)) {
+            return fail({ message: "Unauthorized" }, 401);
+        }
+
         const url = new URL(request.url);
         const path = url.pathname;
         const method = request.method;
 
         switch (method) {
             case "POST":
-                if (path === "/init" || path === "/slots/init") {
-                    const slots = await request.json();
-                    return this.initSlots(slots);
-                } else if (path === "/slot/claim" || path === "/claim") {
-                    const body = await request.json();
-                    const userId = body.user_id ?? body.userId;
-                    const slotId = body.slot_id ?? body.slotId;
-                    const requestId = body.request_id ?? body.requestId;
-                    return this.claimSlot(userId, slotId, requestId);
+                if (path === "/slots/init" || path === "/init") {
+                    const parsed = await this.parseBody(request, initSlotsSchema);
+                    if (!parsed.ok) return parsed.response;
+                    return this.initSlots(parsed.data);
+                } else if (path === "/claim" || path === "/slot/claim") {
+                    const parsed = await this.parseBody(request, claimSlotSchema);
+                    if (!parsed.ok) return parsed.response;
+                    return this.claimSlot(
+                        parsed.data.user_id,
+                        parsed.data.slot_id,
+                        parsed.data.request_id
+                    );
                 } else if (path.startsWith("/claim/redeem/")) {
                     const claimId = path.split("/")[3];
                     return this.redeemClaim(claimId);
                 } else {
-                    return fail({ message: "Not Found" });
+                    return fail({ message: "Not Found" }, 404);
                 }
             case "GET":
                 if (path === "/") {
                     return ok({ message: "SlotCell Durable Object is running" });
-                } else if (path === "/slot" || path === "/slots") {
+                } else if (path === "/slots" || path === "/slot") {
                     return this.getSlots();
+                } else if (path === "/my-claim") {
+                    const userId = url.searchParams.get("user_id");
+                    return this.getMyClaim(userId);
                 } else if (path.startsWith("/claim/")) {
                     const claimId = path.split("/")[2];
                     return this.getClaim(claimId);
                 } else {
-                    return fail({ message: "Not Found" });
+                    return fail({ message: "Not Found" }, 404);
                 }
             default:
-                return fail({ message: "Method Not Allowed" });
+                return fail({ message: "Method Not Allowed" }, 405);
         }
     }
 }
