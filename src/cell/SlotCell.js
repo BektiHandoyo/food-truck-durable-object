@@ -5,6 +5,7 @@ import {
     initSlotsSchema,
     claimSlotSchema,
     redeemClaimSchema,
+    closeSessionSchema,
 } from "../schemas/slotSchemas.js";
 
 export default class SlotCell extends DurableObject {
@@ -350,6 +351,102 @@ export default class SlotCell extends DurableObject {
         }
     }
 
+    resolveTargetSlots(slotIds, foodTruckId) {
+        if (Array.isArray(slotIds) && slotIds.length > 0) {
+            const placeholders = slotIds.map(() => "?").join(", ");
+            return this.sql
+                .exec(`SELECT * FROM slots WHERE id IN (${placeholders})`, ...slotIds)
+                .toArray();
+        }
+
+        if (foodTruckId) {
+            return this.sql
+                .exec(
+                    `SELECT * FROM slots WHERE id = ? OR id LIKE ?`,
+                    foodTruckId,
+                    `${foodTruckId}_%`
+                )
+                .toArray();
+        }
+
+        return this.sql.exec(`SELECT * FROM slots`).toArray();
+    }
+
+    async closeSession(input = {}) {
+        try {
+            const { slot_ids: slotIds, food_truck_id: foodTruckId } = input ?? {};
+            const closedAt = Date.now();
+
+            const payload = this.storage.transactionSync(() => {
+                const targetSlots = this.resolveTargetSlots(slotIds, foodTruckId);
+                if (targetSlots.length === 0) {
+                    return {
+                        closedAt,
+                        slots: [],
+                        claims: [],
+                    };
+                }
+
+                const targetIds = targetSlots.map((slot) => slot.id);
+                const placeholders = targetIds.map(() => "?").join(", ");
+
+                this.sql.exec(
+                    `UPDATE claims
+                     SET status = 'EXPIRED', expires_at = ?
+                     WHERE status = 'CLAIMED' AND slot_id IN (${placeholders})`,
+                    closedAt,
+                    ...targetIds
+                );
+
+                const slots = targetSlots.map((slot) => ({
+                    id: slot.id,
+                    slot_time: slot.slot_time,
+                    quota: slot.quota,
+                    claimed: slot.claimed,
+                    remaining: Math.max(0, slot.quota - slot.claimed),
+                }));
+
+                const claims = this.sql
+                    .exec(
+                        `SELECT * FROM claims
+                         WHERE slot_id IN (${placeholders})
+                         ORDER BY slot_id ASC, queue_pos ASC`,
+                        ...targetIds
+                    )
+                    .toArray();
+
+                return {
+                    closedAt,
+                    slots,
+                    claims,
+                };
+            });
+
+            return ok(payload);
+        } catch (error) {
+            return fail({ message: "Failed to close session", error: error.message });
+        }
+    }
+
+    async exportState() {
+        try {
+            const rows = this.sql.exec(`SELECT * FROM slots`).toArray();
+            const slots = rows.map((slot) => ({
+                id: slot.id,
+                slot_time: slot.slot_time,
+                quota: slot.quota,
+                claimed: slot.claimed,
+                remaining: Math.max(0, slot.quota - slot.claimed),
+            }));
+            const claims = this.sql
+                .exec(`SELECT * FROM claims ORDER BY slot_id ASC, queue_pos ASC`)
+                .toArray();
+            return ok({ slots, claims });
+        } catch (error) {
+            return fail({ message: "Failed to export state", error: error.message });
+        }
+    }
+
     async fetch(request) {
         if (!this.isAuthorized(request)) {
             return fail({ message: "Unauthorized" }, 401);
@@ -377,6 +474,30 @@ export default class SlotCell extends DurableObject {
                     const parsed = await this.parseBody(request, redeemClaimSchema);
                     if (!parsed.ok) return parsed.response;
                     return this.redeemClaim(parsed.data);
+                } else if (path === "/close-session") {
+                    const rawText = await request.text();
+                    let rawJson = {};
+                    if (rawText.trim()) {
+                        try {
+                            rawJson = JSON.parse(rawText);
+                        } catch {
+                            return fail({ message: "Invalid JSON body" }, 400);
+                        }
+                    }
+                    const parsed = closeSessionSchema.safeParse(rawJson);
+                    if (!parsed.success) {
+                        return fail(
+                            {
+                                message: "Invalid request payload",
+                                errors: parsed.error.issues.map((issue) => ({
+                                    path: issue.path.join("."),
+                                    message: issue.message,
+                                })),
+                            },
+                            400
+                        );
+                    }
+                    return this.closeSession(parsed.data);
                 } else if (path.startsWith("/claim/redeem/")) {
                     const claimId = path.split("/")[3];
                     return this.redeemClaim({ claim_id: claimId });
@@ -391,6 +512,8 @@ export default class SlotCell extends DurableObject {
                 } else if (path === "/my-claim") {
                     const userId = url.searchParams.get("user_id");
                     return this.getMyClaim(userId);
+                } else if (path === "/export") {
+                    return this.exportState();
                 } else if (path.startsWith("/claim/")) {
                     const claimId = path.split("/")[2];
                     return this.getClaim(claimId);
