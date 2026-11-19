@@ -1,7 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
 import { initSchema } from "./schema.js";
 import { ok, fail } from "../lib/response.js";
-import { initSlotsSchema, claimSlotSchema } from "../schemas/slotSchemas.js";
+import {
+    initSlotsSchema,
+    claimSlotSchema,
+    redeemClaimSchema,
+} from "../schemas/slotSchemas.js";
 
 export default class SlotCell extends DurableObject {
     /**
@@ -241,34 +245,106 @@ export default class SlotCell extends DurableObject {
         }
     }
 
-    async redeemClaim(claimId) {
+    async redeemClaim(input) {
         try {
-            const claim = this.sql
-                .exec(`SELECT * FROM claims WHERE id = ?`, claimId)
-                .toArray()[0];
+            const payload =
+                typeof input === "string" ? { claim_id: input } : input ?? {};
+            const { claim_id: claimId, user_id: userId } = payload;
 
-            if (!claim) {
-                return fail({ message: "Claim not found" });
-            }
+            const result = this.storage.transactionSync(() => {
+                let claim;
+                if (claimId) {
+                    claim = this.sql
+                        .exec(`SELECT * FROM claims WHERE id = ?`, claimId)
+                        .toArray()[0];
+                } else if (userId) {
+                    claim = this.sql
+                        .exec(
+                            `SELECT * FROM claims
+                             WHERE user_id = ?
+                             ORDER BY CASE
+                                 WHEN status = 'CLAIMED' THEN 0
+                                 WHEN status = 'REDEEMED' THEN 1
+                                 ELSE 2
+                             END, claimed_at DESC
+                             LIMIT 1`,
+                            userId
+                        )
+                        .toArray()[0];
+                }
 
-            if (claim.status !== "CLAIMED") {
-                return fail({ message: `Claim cannot be redeemed (status: ${claim.status})` });
-            }
+                if (!claim) {
+                    return {
+                        success: false,
+                        status: 404,
+                        reason: { message: "Claim not found" },
+                    };
+                }
 
-            const redeemedAt = Date.now();
+                if (claim.status === "REDEEMED") {
+                    return {
+                        success: false,
+                        status: 409,
+                        reason: {
+                            message: "Claim has already been redeemed",
+                            claimId: claim.id,
+                            status: claim.status,
+                            redeemedAt: claim.redeemed_at,
+                        },
+                    };
+                }
 
-            this.sql.exec(
-                `UPDATE claims SET status = 'REDEEMED', redeemed_at = ? WHERE id = ?`,
-                redeemedAt,
-                claimId
-            );
+                if (claim.status === "EXPIRED") {
+                    return {
+                        success: false,
+                        status: 409,
+                        reason: {
+                            message: "Claim has expired",
+                            claimId: claim.id,
+                            status: claim.status,
+                        },
+                    };
+                }
 
-            return ok({
-                message: "Claim redeemed successfully",
-                claimId,
-                status: "REDEEMED",
-                redeemedAt,
+                if (claim.status !== "CLAIMED") {
+                    return {
+                        success: false,
+                        status: 400,
+                        reason: {
+                            message: `Claim cannot be redeemed (status: ${claim.status})`,
+                            claimId: claim.id,
+                            status: claim.status,
+                        },
+                    };
+                }
+
+                const redeemedAt = Date.now();
+                this.sql.exec(
+                    `UPDATE claims SET status = 'REDEEMED', redeemed_at = ? WHERE id = ?`,
+                    redeemedAt,
+                    claim.id
+                );
+
+                return {
+                    success: true,
+                    data: {
+                        message: "Claim redeemed successfully",
+                        claimId: claim.id,
+                        slotId: claim.slot_id,
+                        userId: claim.user_id,
+                        queuePos: claim.queue_pos,
+                        status: "REDEEMED",
+                        claimedAt: claim.claimed_at,
+                        redeemedAt,
+                    },
+                };
             });
+
+            if (!result.success) {
+                return fail(result.reason, result.status);
+            }
+
+            return ok(result.data);
         } catch (error) {
             return fail({ message: "Failed to redeem claim", error: error.message });
         }
@@ -297,9 +373,13 @@ export default class SlotCell extends DurableObject {
                         parsed.data.slot_id,
                         parsed.data.request_id
                     );
+                } else if (path === "/redeem") {
+                    const parsed = await this.parseBody(request, redeemClaimSchema);
+                    if (!parsed.ok) return parsed.response;
+                    return this.redeemClaim(parsed.data);
                 } else if (path.startsWith("/claim/redeem/")) {
                     const claimId = path.split("/")[3];
-                    return this.redeemClaim(claimId);
+                    return this.redeemClaim({ claim_id: claimId });
                 } else {
                     return fail({ message: "Not Found" }, 404);
                 }
