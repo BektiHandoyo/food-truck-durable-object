@@ -22,7 +22,10 @@
 				"name": "SLOT_CELL"
 			}
 		]
-	}	
+	},
+	"vars": {
+		"DO_API_SECRET": "dev-food-truck-secret"
+	}
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
