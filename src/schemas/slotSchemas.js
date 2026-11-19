@@ -33,3 +33,12 @@ export const redeemClaimSchema = z
         message: "Either claim_id or user_id is required",
     });
 
+export const closeSessionSchema = z.object({
+    slot_ids: z
+        .array(z.string().trim().min(1, "slot_id cannot be empty"))
+        .min(1, "slot_ids cannot be empty")
+        .optional(),
+    food_truck_id: z.string().trim().min(1, "food_truck_id cannot be empty").optional(),
+});
+
+
