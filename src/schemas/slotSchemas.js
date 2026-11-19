@@ -23,3 +23,13 @@ export const claimSlotSchema = z.object({
     slot_id: z.string().trim().min(1, "slot_id is required"),
     request_id: z.string().trim().min(1, "request_id is required"),
 });
+
+export const redeemClaimSchema = z
+    .object({
+        claim_id: z.string().trim().min(1, "claim_id cannot be empty").optional(),
+        user_id: z.string().trim().min(1, "user_id cannot be empty").optional(),
+    })
+    .refine((data) => Boolean(data.claim_id || data.user_id), {
+        message: "Either claim_id or user_id is required",
+    });
+
